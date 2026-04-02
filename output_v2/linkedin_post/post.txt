@@ -1,0 +1,59 @@
+🔍 Can AI detect concrete specimen fraud on construction sites?
+
+In China's construction industry, concrete test blocks must be sampled on-site during casting (wet state) and sent to a lab for strength testing weeks later (dry state). The problem: there's a window where blocks can be swapped — replacing a substandard specimen with a stronger one before lab submission.
+
+I built a computer vision system to automatically detect this.
+
+---
+
+💡 Core idea
+
+Every concrete surface has a unique texture fingerprint. By extracting and matching local features between the wet-state and dry-state photos of the same block, the system can determine whether they came from the same physical specimen.
+
+---
+
+🔬 Technical approach
+
+📌 Preprocessing pipeline
+→ QR code recognition to pair wet/dry photos by specimen ID
+→ SAM (Segment Anything Model) to isolate the concrete face as ROI
+→ Blue label detection + perspective correction to normalize viewing angle
+→ Rotation alignment (0°/90°/180°/270°) to handle different photo orientations
+
+📌 Feature matching
+→ Primary: SuperPoint + LightGlue (deep learned sparse matching)
+→ Baselines: ALIKED, SIFT, DoGHardNet, LoFTR, RoMa
+→ Score = 0.5 × mean confidence + 0.5 × RANSAC inlier ratio
+→ Score ≥ 0.60 → SAME | Score < 0.60 → DIFFERENT
+
+---
+
+📊 Results (66 specimen pairs)
+
+SuperPoint + LightGlue consistently achieved the best discrimination between genuine and swapped specimens. The main challenge was false positives caused by adjacent blocks appearing in the wet-state photo — a data collection issue that highlights how much real-world messiness matters.
+
+---
+
+🧩 What I learned
+
+The hardest part wasn't the algorithm — it was the data.
+
+Real construction site photos are inconsistent: varying lighting, angles, blurry images, partially cropped frames, label tabs extending outside the mask area, and molds containing multiple adjacent blocks. None of this shows up in clean benchmark datasets.
+
+Building a robust preprocessing pipeline to handle these edge cases was easily 70% of the work.
+
+---
+
+🖼️ Image guide:
+• Image 1 — SAME verdict: dense, consistent matches across the surface (green = high confidence, yellow = medium, red = low)
+• Image 2 — DIFFERENT verdict: sparse, scattered matches indicating a swapped block
+• Image 3 — Web interface for interactive match visualization and manual review
+• Image 4 — Typical false positive: wet-state photo captured an adjacent block in the mold, creating cross-specimen feature matches
+
+---
+
+The system runs as a local web tool with result review, manual pairing for unreadable QR codes, and ROI audit visualization.
+
+If you're working on industrial inspection, artifact authentication, or any "are these two images of the same object?" problem — happy to connect 🙌
+
+#ComputerVision #ImageMatching #DeepLearning #Python #SuperPoint #LightGlue #SAM #QualityControl #ConstructionTech #AIApplications

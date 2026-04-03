@@ -1,0 +1,35 @@
+{
+  "version": "0.4.35",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "main",
+      "text": "",
+      "points": [
+        [
+          799.21875,
+          629.375
+        ],
+        [
+          803.125,
+          1143.4375
+        ],
+        [
+          1329.6875,
+          1169.21875
+        ],
+        [
+          1326.5625,
+          625.46875
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "polygon",
+      "flags": {}
+    }
+  ],
+  "imagePath": "B3.jpg",
+  "imageData": null,
+  "imageHeight": 1440,
+  "imageWidth": 2560
+}

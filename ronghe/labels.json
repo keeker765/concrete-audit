@@ -1,0 +1,252 @@
+{
+  "宁波大目_250052__1": {
+    "quality": "good",
+    "wet_has_text": "no",
+    "dry_has_text": "yes"
+  },
+  "宁波大目_250052__2": {
+    "quality": "bad",
+    "wet_has_text": "no",
+    "dry_has_text": "yes"
+  },
+  "宁波大目_250052__3": {
+    "wet_has_text": "no",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波大目_250055__1": {
+    "quality": "bad",
+    "wet_has_text": "no",
+    "dry_has_text": "yes",
+    "notes": "原图过小"
+  },
+  "宁波大目_250056__1": {
+    "dry_has_text": "yes",
+    "wet_has_text": "no",
+    "quality": "good"
+  },
+  "宁波大目_250058__3": {
+    "dry_has_text": "yes",
+    "wet_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波大目_250437__1": {
+    "wet_has_text": "no",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波大目_250437__2": {
+    "dry_has_text": "yes",
+    "wet_has_text": "no",
+    "quality": "good"
+  },
+  "宁波大目_250441__2": {
+    "wet_has_text": "no",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波象保_251978（25.10.06）__2": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波象保_251980（25.10.06）__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波象保_251980（25.10.06）__2": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波象保_251980（25.10.06）__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波象保_252003（25.10.09）__1": {
+    "quality": "good",
+    "notes": "标签没有成圆形"
+  },
+  "宁波象保_252028（25.10.11）__2": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good",
+    "notes": "湿混凝土没有写字写全和干的相比较"
+  },
+  "宁波象保_252049(25.10.13)__2": {
+    "wet_has_text": "no",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波象保_252142(25.10.21)__1": {
+    "wet_has_text": "no",
+    "dry_has_text": "yes",
+    "quality": "ok"
+  },
+  "宁波象保_252178(25.10.25)__2": {
+    "wet_has_text": "no",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波象保_252239（25.11.03）__2": {
+    "wet_has_text": "no",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "宁波象保_252422(25.11.25)__3": {
+    "quality": "good",
+    "notes": "标签没有成圆形 有小耳朵"
+  },
+  "日升集团_250103__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "日升集团_250104__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "日升集团_250266__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good",
+    "notes": "数据质量不够好"
+  },
+  "日升集团_250270__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good",
+    "notes": "数据质量不够好"
+  },
+  "日升集团_250451__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "日升集团_250451__2": {
+    "wet_has_text": "yes",
+    "notes": "数据质量不够好 湿态的有多个 砖块测试样本进入视角",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "日升集团_250453__2": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "notes": "湿态多个样本进入视角",
+    "quality": "good"
+  },
+  "象山县美_250382（25.11.03）__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "象山县美_250413（25.11.08）__3": {
+    "quality": "good"
+  },
+  "象山县美_250450（25.11.11）__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "象山县美_250450（25.11.11）__2": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "notes": "标签有蓝色小耳朵",
+    "quality": "good"
+  },
+  "象山县美_250450（25.11.11）__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good",
+    "notes": "显示的椭圆有点问题"
+  },
+  "象山县美_250501(25.11.17)__2": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "notes": "标签有一个小耳朵",
+    "quality": "good"
+  },
+  "象山县美_250501(25.11.17)__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good",
+    "notes": "截取过小不过也不是大问题"
+  },
+  "象山县美_250524（25.11.21）__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "notes": "标签有蓝色小耳朵",
+    "quality": "good"
+  },
+  "象山县美_250524（25.11.21）__2": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good",
+    "notes": "湿态蓝色标签识别显示 不全 过小"
+  },
+  "象山县美_250524（25.11.21）__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes"
+  },
+  "象山县美_250588（25.11.29）__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "notes": "标签有蓝色小耳朵",
+    "quality": "good"
+  },
+  "象山县美_250588（25.11.29）__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "象山县美_250616(25.12.02)__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "象山县美_250704(25.12.10)__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "象山县美_250739(25.12.13)__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "象山县美_250815(25.12.20)__1": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good"
+  },
+  "象山县美_250815(25.12.20)__2": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good",
+    "notes": "蓝色标签有两个小耳朵"
+  },
+  "象山县美_250832(25.12.22)__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "quality": "good",
+    "notes": "图像中有多个蓝色标签"
+  },
+  "象山甬港_250107（25.09.10）__3": {
+    "wet_has_text": "no",
+    "dry_has_text": "no",
+    "quality": "good"
+  },
+  "宁波大目_250056__2": {
+    "dry_has_text": "yes",
+    "wet_has_text": "no",
+    "quality": "bad"
+  },
+  "宁波大目_250059__3": {
+    "wet_has_text": "yes",
+    "dry_has_text": "yes",
+    "notes": "干态没有截取好 数据问题可能"
+  }
+}

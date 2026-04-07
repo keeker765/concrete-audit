@@ -1,0 +1,1407 @@
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from ultralytics import YOLO
+
+# ============================================================
+# Make ronghe/ importable (reuse keypoint matching + visualization)
+# ============================================================
+RONGHE_ROOT = Path(__file__).resolve().parents[1]  # ...\ronghe
+if str(RONGHE_ROOT) not in sys.path:
+    sys.path.insert(0, str(RONGHE_ROOT))
+
+# Reuse Ronghe's SuperPoint+LightGlue matching + visualization
+from pipeline.config import DEVICE, MAX_KEYPOINTS
+from pipeline.preprocess import load_and_preprocess
+from pipeline.matching import filter_matches, compute_score
+from pipeline.visualization import draw_matches_vis
+# NOTE: lightglue is installed for Python310, but some envs still fail to import it.
+# Make this optional so the rest of the script can still run.
+try:
+    from lightglue import LightGlue, SuperPoint
+except Exception as e:
+    LightGlue = None
+    SuperPoint = None
+    print(f"[WARN] lightglue import failed: {e}")
+
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / 'best(1).pt'
+OUTPUT_DIR = BASE_DIR / 'train_compare_outputs'
+
+# Default sample dir: reuse Ronghe's sample folder (same ABC layout)
+SAMPLE_DIR = (RONGHE_ROOT / 'sample')
+IMG_SIZE = 640
+
+# 取消 GPU 加速：本脚本全程使用 CPU
+# 精细度控制：fast / medium / deep
+QUALITY_LEVEL = 'deep'  # 可选 'fast', 'medium', 'deep'
+
+WEIGHT_COSINE = 0.40
+WEIGHT_EUCLIDEAN = 0.20
+WEIGHT_MASK_AREA = 0.16
+WEIGHT_ASPECT_RATIO = 0.12
+WEIGHT_CONTOUR_AREA = 0.12
+VALID_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+
+# ===== 统计阈值（对比度低的判定阈值）=====
+LOW_MATCH_THRESHOLD = 0.80
+
+
+
+
+
+
+
+def load_model():
+    model = YOLO(str(MODEL_PATH))
+    model.model.eval()
+    model.model.to('cpu')
+    return model
+
+
+def load_image(image_path):
+    img_bgr = cv2.imread(str(image_path))
+    if img_bgr is None:
+        raise ValueError(f'无法读取图片: {image_path}')
+    return img_bgr
+
+
+def create_run_output_dir():
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    run_name = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = OUTPUT_DIR / run_name
+    run_dir.mkdir(exist_ok=True)
+    return run_dir
+
+
+def _rectify_transform_from_qr(img_shape_hw, pts):
+    """给定二维码四点，返回透视矩阵 M=shift@H 以及输出尺寸 (out_w,out_h)。"""
+    src = np.array(pts).reshape(4, 2).astype(np.float32)
+    side = float(np.mean([
+        np.linalg.norm(src[1] - src[0]),
+        np.linalg.norm(src[2] - src[1]),
+        np.linalg.norm(src[3] - src[2]),
+        np.linalg.norm(src[0] - src[3]),
+    ]))
+    dst = np.array([[0, 0], [side, 0], [side, side], [0, side]], dtype=np.float32)
+
+    H = cv2.getPerspectiveTransform(src, dst)
+    h, w = img_shape_hw
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
+    mapped = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+
+    x_min, y_min = mapped.min(axis=0)
+    x_max, y_max = mapped.max(axis=0)
+
+    shift = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=np.float64)
+    out_w = int(np.ceil(x_max - x_min))
+    out_h = int(np.ceil(y_max - y_min))
+    M = shift @ H
+    return M, (out_w, out_h)
+
+
+def rectify_by_qr(img, pts):
+    h, w = img.shape[:2]
+    M, (out_w, out_h) = _rectify_transform_from_qr((h, w), pts)
+    return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+
+def warp_mask_with_M(mask_u8, M, out_size_wh):
+    """mask 用同一个透视矩阵同步拉正（最近邻，保持0/1）。"""
+    out_w, out_h = out_size_wh
+    warped = cv2.warpPerspective(mask_u8.astype(np.uint8) * 255, M, (out_w, out_h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return (warped > 127).astype(np.uint8)
+
+
+def detect_qr_robust(img):
+    detector = cv2.QRCodeDetector()
+    text, pts, _ = detector.detectAndDecode(img)
+    if pts is not None and text:
+        return text, pts, img
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+    enhanced = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+    text, pts, _ = detector.detectAndDecode(enhanced)
+    if pts is not None and text:
+        return text, pts, enhanced
+
+    h, w = img.shape[:2]
+    for scale in [0.5, 0.75, 1.5, 0.25]:
+        resized = cv2.resize(img, (int(w * scale), int(h * scale)))
+        text, pts, _ = detector.detectAndDecode(resized)
+        if pts is not None and text:
+            return text, pts / scale, img
+    return '', None, img
+
+
+def rectify_and_read_qr(img_bgr, mask_u8=None):
+    """对输入图做二维码检测并拉正；若提供 mask，则用同一矩阵同步拉正 mask。"""
+    qr_text, points, _ = detect_qr_robust(img_bgr)
+    if points is None:
+        return img_bgr, False, '', None, None
+
+    h, w = img_bgr.shape[:2]
+    M, (out_w, out_h) = _rectify_transform_from_qr((h, w), points[0])
+    rectified = cv2.warpPerspective(img_bgr, M, (out_w, out_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+    rectified_mask = None
+    if mask_u8 is not None:
+        rectified_mask = warp_mask_with_M(mask_u8, M, (out_w, out_h))
+
+    qr_text_after, _, _ = detect_qr_robust(rectified)
+    return rectified, True, (qr_text_after or qr_text), points, rectified_mask
+
+
+def segment_main_object(model, img_bgr):
+    results = model.predict(source=img_bgr, device='cpu', verbose=False)
+    result = results[0]
+    if result.masks is None or result.boxes is None or len(result.boxes) == 0:
+        return img_bgr, None, None, None
+    scores = result.boxes.conf.cpu().numpy()
+    best_idx = int(np.argmax(scores))
+    mask = result.masks.data[best_idx].cpu().numpy()
+    mask = (mask > 0.5).astype(np.uint8)
+    mask = cv2.resize(mask, (img_bgr.shape[1], img_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+    box_xyxy = None
+    if result.boxes.xyxy is not None and len(result.boxes.xyxy) > best_idx:
+        box_xyxy = result.boxes.xyxy[best_idx].cpu().numpy().astype(int)
+    if box_xyxy is None:
+        return img_bgr, None, None, None
+    x1, y1, x2, y2 = [int(v) for v in box_xyxy]
+    h, w = img_bgr.shape[:2]
+    x1 = max(0, min(w - 1, x1))
+    x2 = max(0, min(w - 1, x2))
+    y1 = max(0, min(h - 1, y1))
+    y2 = max(0, min(h - 1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return img_bgr, None, box_xyxy, None
+    crop_xyxy = (x1, y1, x2, y2)
+    cropped = img_bgr[y1:y2 + 1, x1:x2 + 1].copy()
+    cropped_mask = mask[y1:y2 + 1, x1:x2 + 1]
+    cropped[cropped_mask == 0] = 0
+    return cropped, mask, box_xyxy, crop_xyxy
+
+
+def draw_qr_polygon(img_bgr, qr_points, color=(0, 255, 255), thickness=3):
+    canvas = img_bgr.copy()
+    if qr_points is None:
+        return canvas
+    pts = np.array(qr_points).reshape(-1, 2).astype(int)
+    if len(pts) >= 4:
+        cv2.polylines(canvas, [pts.reshape((-1, 1, 2))], True, color, thickness)
+    return canvas
+
+
+def build_qr_exclude_mask(img_shape_hw, qr_points, expand_px=8):
+    """Build a filled polygon mask for QR region so points inside it can be excluded.
+    expand_px: small outward dilation to avoid near-border noisy matches.
+    """
+    h, w = img_shape_hw[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if qr_points is None:
+        return mask
+    pts = np.array(qr_points).reshape(-1, 2).astype(np.int32)
+    if len(pts) >= 4:
+        cv2.fillPoly(mask, [pts.reshape((-1, 1, 2))], 255)
+        if expand_px > 0:
+            k = max(3, int(expand_px) * 2 + 1)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
+
+
+def build_blue_exclude_mask(img_bgr, expand_px=10):
+    """Detect blue label/ring region on rectified image and exclude it from matching.
+    This is intentionally broad: anything in the blue tag/ring area should not
+    contribute to concrete texture matching.
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    # Blue range tuned to include sticker border/ring and saturated blue label area.
+    blue_mask = cv2.inRange(hsv, (90, 50, 40), (140, 255, 255))
+    if blue_mask is None:
+        return np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+
+    # Clean tiny noise, then expand region a bit so near-edge keypoints are also excluded.
+    k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, k1)
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, k1)
+    if expand_px > 0:
+        k = max(3, int(expand_px) * 2 + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        blue_mask = cv2.dilate(blue_mask, kernel, iterations=1)
+    return blue_mask
+
+
+def filter_matches_outside_exclude_masks(kpts0, kpts1, matches, scores, exclude0, exclude1):
+    """Remove matches if either endpoint falls inside the exclude masks (e.g. QR region)."""
+    if matches is None or len(matches) == 0:
+        return matches, scores
+
+    keep = []
+    for i, m in enumerate(matches):
+        p0 = kpts0[m[0]].detach().cpu().numpy()
+        p1 = kpts1[m[1]].detach().cpu().numpy()
+        x0, y0 = int(round(float(p0[0]))), int(round(float(p0[1])))
+        x1, y1 = int(round(float(p1[0]))), int(round(float(p1[1])))
+
+        in_ex0 = (0 <= y0 < exclude0.shape[0] and 0 <= x0 < exclude0.shape[1] and exclude0[y0, x0] > 0)
+        in_ex1 = (0 <= y1 < exclude1.shape[0] and 0 <= x1 < exclude1.shape[1] and exclude1[y1, x1] > 0)
+        if not in_ex0 and not in_ex1:
+            keep.append(i)
+
+    if not keep:
+        empty_idx = torch.empty((0,), dtype=torch.long)
+        return matches[empty_idx], scores[empty_idx] if scores is not None else scores
+
+    keep_t = torch.tensor(keep, dtype=torch.long)
+    matches_f = matches[keep_t]
+    scores_f = scores[keep_t] if scores is not None else None
+    return matches_f, scores_f
+
+
+def _qr_center_and_size(qr_points, img_shape_hw):
+    h, w = img_shape_hw[:2]
+    if qr_points is None:
+        return np.array([w / 2.0, h / 2.0], dtype=np.float32), max(w, h)
+    pts = np.array(qr_points).reshape(-1, 2).astype(np.float32)
+    if len(pts) < 4:
+        return np.array([w / 2.0, h / 2.0], dtype=np.float32), max(w, h)
+    center = pts.mean(axis=0)
+    side = float(np.mean([
+        np.linalg.norm(pts[1] - pts[0]),
+        np.linalg.norm(pts[2] - pts[1]),
+        np.linalg.norm(pts[3] - pts[2]),
+        np.linalg.norm(pts[0] - pts[3]),
+    ]))
+    return center, max(side, 1.0)
+
+
+def filter_matches_by_relative_geometry(kpts0, kpts1, matches, scores,
+                                        img_shape0, img_shape1,
+                                        qr_points0=None, qr_points1=None,
+                                        max_qr_rel_diff=0.35,
+                                        max_edge_rel_diff=0.22):
+    """Keep matches whose relative position wrt QR and image borders is similar.
+
+    Rules:
+    - Relative vector to QR center (normalized by QR size) should be similar.
+    - Relative distances to left/right/top/bottom image borders should be similar.
+    - Allow a little deviation, but not too much.
+    """
+    if matches is None or len(matches) == 0:
+        return matches, scores
+
+    h0, w0 = img_shape0[:2]
+    h1, w1 = img_shape1[:2]
+    c0, s0 = _qr_center_and_size(qr_points0, img_shape0)
+    c1, s1 = _qr_center_and_size(qr_points1, img_shape1)
+
+    keep = []
+    for i, m in enumerate(matches):
+        p0 = kpts0[m[0]].detach().cpu().numpy().astype(np.float32)
+        p1 = kpts1[m[1]].detach().cpu().numpy().astype(np.float32)
+
+        # 1) relative to QR center (normalized by QR size)
+        qr_rel0 = (p0 - c0) / s0
+        qr_rel1 = (p1 - c1) / s1
+        qr_rel_diff = float(np.linalg.norm(qr_rel0 - qr_rel1))
+
+        # 2) relative to borders (normalized distances to four edges)
+        edge0 = np.array([p0[0] / max(w0, 1), p0[1] / max(h0, 1),
+                          (w0 - p0[0]) / max(w0, 1), (h0 - p0[1]) / max(h0, 1)], dtype=np.float32)
+        edge1 = np.array([p1[0] / max(w1, 1), p1[1] / max(h1, 1),
+                          (w1 - p1[0]) / max(w1, 1), (h1 - p1[1]) / max(h1, 1)], dtype=np.float32)
+        edge_rel_diff = float(np.max(np.abs(edge0 - edge1)))
+
+        if qr_rel_diff <= max_qr_rel_diff and edge_rel_diff <= max_edge_rel_diff:
+            keep.append(i)
+
+    if not keep:
+        empty_idx = torch.empty((0,), dtype=torch.long)
+        return matches[empty_idx], scores[empty_idx] if scores is not None else scores
+
+    keep_t = torch.tensor(keep, dtype=torch.long)
+    matches_f = matches[keep_t]
+    scores_f = scores[keep_t] if scores is not None else None
+    return matches_f, scores_f
+
+
+def draw_mask_overlay(img_bgr, mask, color=(0, 0, 255), alpha=0.35):
+    canvas = img_bgr.copy()
+    if mask is None:
+        return canvas
+    overlay = canvas.copy()
+    overlay[mask > 0] = color
+    return cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0)
+
+
+def draw_detection_visual(img_bgr, mask=None, box_xyxy=None, qr_points=None, title='', qr_text=''):
+    canvas = draw_mask_overlay(img_bgr, mask)
+    canvas = draw_qr_polygon(canvas, qr_points)
+    if box_xyxy is not None:
+        x1, y1, x2, y2 = [int(v) for v in box_xyxy]
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    if title:
+        cv2.putText(canvas, title, (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+    if qr_text:
+        qr_show = f'QR: {qr_text}'
+        cv2.rectangle(canvas, (12, 52), (min(canvas.shape[1] - 12, 12 + max(420, len(qr_show) * 16)), 96), (0, 0, 0), -1)
+        cv2.putText(canvas, qr_show, (20, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    return canvas
+
+
+def make_side_by_side(img1, img2, label1='Image 1', label2='Image 2'):
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+    target_h = max(h1, h2)
+
+    def resize_keep(img, target_h):
+        h, w = img.shape[:2]
+        scale = target_h / max(h, 1)
+        new_w = max(1, int(round(w * scale)))
+        return cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    r1 = resize_keep(img1, target_h)
+    r2 = resize_keep(img2, target_h)
+    pad = np.full((target_h, 30, 3), 30, dtype=np.uint8)
+    merged = np.hstack([r1, pad, r2])
+    cv2.putText(merged, label1, (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(merged, label2, (r1.shape[1] + 50, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+    return merged
+
+
+def save_visualizations(pair_dir, image1_path, image2_path, orig1, orig2, rectified1, rectified2, mask1, mask2, rect_mask1, rect_mask2, box1, box2, crop1_xyxy, crop2_xyxy, qr_points1, qr_points2, qr_text1, qr_text2, fitness, decision_note, match_overlay_data=None, match_base_imgs=None, score_breakdown=None):
+    vis_orig1 = draw_detection_visual(orig1, mask1, box1, None, '原图1 / YOLO', qr_text1)
+    vis_orig2 = draw_detection_visual(orig2, mask2, box2, None, '原图2 / YOLO', qr_text2)
+    # 在拉正图上重新检测一次二维码点，用于可视化框（避免坐标系错位）
+    _, rect_pts1, _ = detect_qr_robust(rectified1)
+    _, rect_pts2, _ = detect_qr_robust(rectified2)
+    vis_rect1 = draw_detection_visual(rectified1, rect_mask1, None, rect_pts1, '裁剪后拉正图1 / QR', qr_text1)
+    vis_rect2 = draw_detection_visual(rectified2, rect_mask2, None, rect_pts2, '裁剪后拉正图2 / QR', qr_text2)
+
+    # IMPORTANT:
+    # vis_compare_rectified should use the SAME base images as the keypoint matcher,
+    # otherwise point-line overlay will look chaotic/misaligned.
+    if match_base_imgs is not None:
+        base_rect1, base_rect2 = match_base_imgs
+    else:
+        base_rect1, base_rect2 = rectified1, rectified2
+
+    compare_orig = make_side_by_side(vis_orig1, vis_orig2, '原图1', '原图2')
+
+    # ===== Draw Ronghe keypoint lines on the SAME base images used by the matcher =====
+    # This avoids visual chaos caused by overlaying points computed on one image space
+    # onto another differently-rendered image space.
+    target_h = max(base_rect1.shape[0], base_rect2.shape[0])
+    gap = 30
+
+    def _resize_keep(img, target_h):
+        h, w = img.shape[:2]
+        scale = target_h / max(h, 1)
+        new_w = max(1, int(round(w * scale)))
+        return cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_LINEAR), scale
+
+    base_rect1_r, scale0 = _resize_keep(base_rect1, target_h)
+    base_rect2_r, scale1 = _resize_keep(base_rect2, target_h)
+    pad = np.full((target_h, gap, 3), 30, dtype=np.uint8)
+    compare_rect = np.hstack([base_rect1_r, pad, base_rect2_r])
+    cv2.putText(compare_rect, '拉正图1', (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(compare_rect, '拉正图2', (base_rect1_r.shape[1] + 20 + gap, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+
+    if match_overlay_data is not None:
+        try:
+            pts0 = match_overlay_data.get('pts0')
+            pts1 = match_overlay_data.get('pts1')
+            inliers_mask = match_overlay_data.get('inliers_mask')
+            if pts0 is not None and pts1 is not None and inliers_mask is not None:
+                overlay = compare_rect.copy()
+                x_offset = base_rect1_r.shape[1] + gap
+                n = min(len(pts0), len(pts1), len(inliers_mask))
+                for i in range(n):
+                    p0 = pts0[i]
+                    p1 = pts1[i]
+                    is_inlier = bool(inliers_mask[i])
+                    color = (0, 255, 0) if is_inlier else (0, 0, 255)
+                    x0 = int(round(float(p0[0]) * scale0))
+                    y0 = int(round(float(p0[1]) * scale0))
+                    x1 = int(round(float(p1[0]) * scale1)) + x_offset
+                    y1 = int(round(float(p1[1]) * scale1))
+                    cv2.line(overlay, (x0, y0), (x1, y1), color, 1, cv2.LINE_AA)
+                    cv2.circle(overlay, (x0, y0), 4, color, 1, cv2.LINE_AA)
+                    cv2.circle(overlay, (x1, y1), 4, color, 1, cv2.LINE_AA)
+                compare_rect = cv2.addWeighted(overlay, 0.72, compare_rect, 0.28, 0)
+        except Exception:
+            pass
+
+    info_h = 126 if score_breakdown is not None else 74
+    cv2.rectangle(compare_rect, (10, compare_rect.shape[0] - info_h), (min(compare_rect.shape[1] - 10, 1280), compare_rect.shape[0] - 10), (0, 0, 0), -1)
+    cv2.putText(compare_rect, f'{decision_note} | 匹配度={fitness:.4f}', (20, compare_rect.shape[0] - info_h + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
+    if score_breakdown is not None:
+        txt2 = f"CNN/YOLO/QR={score_breakdown.get('cnn_fitness', 0.0):.4f} x 45%   SP+LG={score_breakdown.get('sp_lg_score', 0.0):.4f} x 30%"
+        txt3 = f"filtered={score_breakdown.get('sp_lg_filtered_matches', 0)} x 15%  inlier_ratio={score_breakdown.get('sp_lg_inlier_ratio', 0.0):.4f} x 10%  raw={score_breakdown.get('sp_lg_raw_matches', 0)}  inliers={score_breakdown.get('sp_lg_inliers', 0)}  mean_conf={score_breakdown.get('sp_lg_mean_conf', 0.0):.4f}"
+        cv2.putText(compare_rect, txt2, (20, compare_rect.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(compare_rect, txt3, (20, compare_rect.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (180, 255, 180), 2, cv2.LINE_AA)
+
+    cv2.imwrite(str(pair_dir / f'vis_original_1_{Path(image1_path).stem}.jpg'), vis_orig1)
+    cv2.imwrite(str(pair_dir / f'vis_original_2_{Path(image2_path).stem}.jpg'), vis_orig2)
+    cv2.imwrite(str(pair_dir / f'vis_mask_1_{Path(image1_path).stem}.jpg'), vis_rect1)
+    cv2.imwrite(str(pair_dir / f'vis_mask_2_{Path(image2_path).stem}.jpg'), vis_rect2)
+    cv2.imwrite(str(pair_dir / 'vis_compare_original.jpg'), compare_orig)
+    cv2.imwrite(str(pair_dir / 'vis_compare_rectified.jpg'), compare_rect)
+    return compare_orig, compare_rect
+
+
+def preprocess_cropped_image(img_bgr, img_size=IMG_SIZE):
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_rgb = cv2.resize(img_rgb, (img_size, img_size))
+    tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+    return tensor.unsqueeze(0)
+
+
+def preprocess_cropped_image_multiscale(img_bgr, img_size=IMG_SIZE, scales=[0.9, 1.0, 1.1]):
+    """多尺度预处理，生成不同尺度的图像张量 - 使用更小范围和更少尺度"""
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h, w = img_rgb.shape[:2]
+    tensors = []
+    
+    for scale in scales:
+        new_h, new_w = int(h * scale), int(w * scale)
+        resized = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # 中心裁剪或填充到目标尺寸
+        if new_h < img_size or new_w < img_size:
+            # 需要填充
+            pad_h = max(0, img_size - new_h)
+            pad_w = max(0, img_size - new_w)
+            top = pad_h // 2
+            bottom = pad_h - top
+            left = pad_w // 2
+            right = pad_w - left
+            resized = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        
+        # 中心裁剪
+        start_h = (resized.shape[0] - img_size) // 2
+        start_w = (resized.shape[1] - img_size) // 2
+        cropped = resized[start_h:start_h + img_size, start_w:start_w + img_size]
+        
+        tensor = torch.from_numpy(cropped).permute(2, 0, 1).float() / 255.0
+        tensors.append(tensor.unsqueeze(0))
+    
+    return tensors
+
+
+def extract_feature_from_cropped(model, cropped_bgr):
+    """提取深度特征 - 使用多尺度特征融合"""
+    # 多尺度特征提取
+    multi_scale_tensors = preprocess_cropped_image_multiscale(cropped_bgr, img_size=IMG_SIZE)
+    
+    all_features = []
+    spatial_features_list = []
+    
+    with torch.no_grad():
+        for x in multi_scale_tensors:
+            outputs = model.model(x)
+            tensors = []
+            spatial_tensors = []
+
+            def collect_tensors(obj, keep_spatial=False):
+                if isinstance(obj, torch.Tensor):
+                    if obj.ndim == 4:
+                        if keep_spatial and len(spatial_tensors) == 0:  # 只保留第一个空间特征
+                            spatial_tensors.append(obj)
+                        # 全局池化特征
+                        if obj.shape[2] >= 4 and obj.shape[3] >= 4:  # 只保留足够大的特征图
+                            tensors.append(F.adaptive_avg_pool2d(obj, (1, 1)).flatten(1))
+                    elif obj.ndim == 3:
+                        tensors.append(obj.mean(dim=1))
+                    elif obj.ndim == 2:
+                        tensors.append(obj)
+                elif isinstance(obj, (list, tuple)):
+                    for item in obj:
+                        collect_tensors(item, keep_spatial=keep_spatial)
+                elif isinstance(obj, dict):
+                    for item in obj.values():
+                        collect_tensors(item, keep_spatial=keep_spatial)
+
+            collect_tensors(outputs, keep_spatial=True)
+            
+            if not tensors:
+                raise RuntimeError('未能从模型输出中提取到有效特征')
+            
+            # 合并当前尺度的特征（限制特征维度以避免过大）
+            if len(tensors) > 4:
+                tensors = tensors[:4]  # 只取前4个特征张量
+            scale_embedding = torch.cat(tuple(tensors), dim=1)
+            all_features.append(scale_embedding)
+            
+            # 保存空间特征用于局部匹配
+            if spatial_tensors:
+                spatial_features_list.append(spatial_tensors[0])
+    
+    # 多尺度特征融合（加权平均）- 简化权重
+    weights = [0.2, 0.6, 0.2]  # 小、中、大尺度的权重，中间权重更高
+    fused_features = []
+    for i, feat in enumerate(all_features):
+        w = weights[i] if i < len(weights) else 1.0 / len(all_features)
+        fused_features.append(feat * w)
+    
+    embedding = torch.sum(torch.stack(fused_features), dim=0)
+    embedding = F.normalize(embedding, p=2, dim=1)
+    
+    # 计算局部特征相似度
+    local_similarity = None
+    if len(spatial_features_list) >= 2:
+        # 使用中间尺度的空间特征进行局部匹配
+        mid_spatial = spatial_features_list[1]  # 1.0x 尺度
+        local_similarity = mid_spatial
+    
+    return embedding.squeeze(0).cpu().numpy(), local_similarity
+
+
+def compute_local_feature_similarity(spatial_feat1, spatial_feat2):
+    """计算局部特征相似度 - 简化版本"""
+    if spatial_feat1 is None or spatial_feat2 is None:
+        return 0.5  # 默认值
+    
+    # 确保空间维度一致
+    if spatial_feat1.shape != spatial_feat2.shape:
+        # 使用插值调整到相同尺寸
+        target_h = min(spatial_feat1.shape[2], spatial_feat2.shape[2])
+        target_w = min(spatial_feat1.shape[3], spatial_feat2.shape[3])
+        spatial_feat1 = F.interpolate(spatial_feat1, size=(target_h, target_w), mode='bilinear', align_corners=False)
+        spatial_feat2 = F.interpolate(spatial_feat2, size=(target_h, target_w), mode='bilinear', align_corners=False)
+    
+    # 简化版：直接计算余弦相似度（不使用复杂的注意力机制）
+    feat1_flat = F.normalize(spatial_feat1.flatten(2), p=2, dim=1)
+    feat2_flat = F.normalize(spatial_feat2.flatten(2), p=2, dim=1)
+    
+    # 计算平均余弦相似度
+    similarity = torch.mean(torch.sum(feat1_flat * feat2_flat, dim=1))
+    
+    # 转换到0-1范围
+    local_sim = (similarity.item() + 1) / 2
+    return max(0.0, min(1.0, local_sim))
+
+
+def compute_structural_similarity(img1, img2):
+    """计算结构相似性 (SSIM) - 感知相似度"""
+    # 转换为灰度图
+    if len(img1.shape) == 3:
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    else:
+        gray1 = img1
+    
+    if len(img2.shape) == 3:
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    else:
+        gray2 = img2
+    
+    # 确保尺寸一致
+    if gray1.shape != gray2.shape:
+        gray2 = cv2.resize(gray2, (gray1.shape[1], gray1.shape[0]))
+    
+    # 计算SSIM
+    mu1 = cv2.GaussianBlur(gray1.astype(np.float32), (11, 11), 1.5)
+    mu2 = cv2.GaussianBlur(gray2.astype(np.float32), (11, 11), 1.5)
+    
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+    
+    sigma1_sq = cv2.GaussianBlur(gray1.astype(np.float32) ** 2, (11, 11), 1.5) - mu1_sq
+    sigma2_sq = cv2.GaussianBlur(gray2.astype(np.float32) ** 2, (11, 11), 1.5) - mu2_sq
+    sigma12 = cv2.GaussianBlur(gray1.astype(np.float32) * gray2.astype(np.float32), (11, 11), 1.5) - mu1_mu2
+    
+    c1 = (0.01 * 255) ** 2
+    c2 = (0.03 * 255) ** 2
+    
+    ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2))
+    
+    return float(np.mean(ssim_map))
+
+
+def compute_ssim_fast(img1, img2):
+    """快速SSIM - 使用降采样"""
+    # 转换为灰度并降采样
+    if len(img1.shape) == 3:
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    else:
+        gray1 = img1
+    
+    if len(img2.shape) == 3:
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    else:
+        gray2 = img2
+    
+    # 降采样到128x128以加速
+    gray1 = cv2.resize(gray1, (128, 128))
+    gray2 = cv2.resize(gray2, (128, 128))
+    
+    # 简化版SSIM - 使用均值滤波代替高斯滤波
+    mu1 = cv2.blur(gray1.astype(np.float32), (7, 7))
+    mu2 = cv2.blur(gray2.astype(np.float32), (7, 7))
+    
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+    
+    sigma1_sq = cv2.blur(gray1.astype(np.float32)**2, (7, 7)) - mu1_sq
+    sigma2_sq = cv2.blur(gray2.astype(np.float32)**2, (7, 7)) - mu2_sq
+    sigma12 = cv2.blur(gray1.astype(np.float32)*gray2.astype(np.float32), (7, 7)) - mu1_mu2
+    
+    c1 = (0.01 * 255) ** 2
+    c2 = (0.03 * 255) ** 2
+    
+    ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2) + 1e-8)
+    
+    return float(np.mean(ssim_map))
+
+
+def compute_histogram_similarity(img1, img2):
+    """计算颜色直方图相似度"""
+    # 转换为HSV颜色空间
+    hsv1 = cv2.cvtColor(img1, cv2.COLOR_BGR2HSV)
+    hsv2 = cv2.cvtColor(img2, cv2.COLOR_BGR2HSV)
+    
+    # 计算H和S通道的直方图
+    hist1_h = cv2.calcHist([hsv1], [0], None, [180], [0, 180])
+    hist1_s = cv2.calcHist([hsv1], [1], None, [256], [0, 256])
+    hist2_h = cv2.calcHist([hsv2], [0], None, [180], [0, 180])
+    hist2_s = cv2.calcHist([hsv2], [1], None, [256], [0, 256])
+    
+    # 归一化
+    cv2.normalize(hist1_h, hist1_h, 0, 1, cv2.NORM_MINMAX)
+    cv2.normalize(hist1_s, hist1_s, 0, 1, cv2.NORM_MINMAX)
+    cv2.normalize(hist2_h, hist2_h, 0, 1, cv2.NORM_MINMAX)
+    cv2.normalize(hist2_s, hist2_s, 0, 1, cv2.NORM_MINMAX)
+    
+    # 计算相关性
+    corr_h = cv2.compareHist(hist1_h, hist2_h, cv2.HISTCMP_CORREL)
+    corr_s = cv2.compareHist(hist1_s, hist2_s, cv2.HISTCMP_CORREL)
+    
+    return (max(0, corr_h) + max(0, corr_s)) / 2
+
+
+def extract_texture_features(img):
+    """快速纹理特征提取 - 使用积分图和降采样"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # 降采样以加速
+    small = cv2.resize(gray, (64, 64))
+    
+    # 使用Sobel算子提取梯度特征（比LBP快得多）
+    sobelx = cv2.Sobel(small, cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(small, cv2.CV_32F, 0, 1, ksize=3)
+    
+    # 计算梯度幅值和方向直方图
+    magnitude = np.sqrt(sobelx**2 + sobely**2)
+    direction = np.arctan2(sobely, sobelx) * 180 / np.pi
+    
+    # 分块统计
+    features = []
+    h, w = small.shape
+    blocks = 4
+    bh, bw = h // blocks, w // blocks
+    
+    for i in range(blocks):
+        for j in range(blocks):
+            block_mag = magnitude[i*bh:(i+1)*bh, j*bw:(j+1)*bw]
+            block_dir = direction[i*bh:(i+1)*bh, j*bw:(j+1)*bw]
+            
+            # 梯度幅值均值
+            features.append(np.mean(block_mag))
+            # 梯度方向直方图（8个bin）
+            hist, _ = np.histogram(block_dir, bins=8, range=(-180, 180))
+            features.extend(hist / (np.sum(hist) + 1e-8))
+    
+    return np.array(features, dtype=np.float32)
+
+
+def compute_texture_similarity(img1, img2):
+    """快速纹理相似度计算"""
+    if img1.shape != img2.shape:
+        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+    
+    feat1 = extract_texture_features(img1)
+    feat2 = extract_texture_features(img2)
+    
+    # 余弦相似度
+    dot = np.dot(feat1, feat2)
+    norm1 = np.linalg.norm(feat1)
+    norm2 = np.linalg.norm(feat2)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.5
+    
+    similarity = dot / (norm1 * norm2)
+    return (similarity + 1) / 2
+
+
+def cosine_similarity(vec1, vec2):
+    return float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+
+
+def euclidean_distance(vec1, vec2):
+    return float(np.linalg.norm(vec1 - vec2))
+
+
+def extract_mask_features(mask):
+    if mask is None:
+        return {'area_ratio': None, 'aspect_ratio': None, 'contour_area_ratio': None}
+    binary = (mask > 0).astype(np.uint8)
+    h, w = binary.shape[:2]
+    area_ratio = float(binary.sum() / (h * w)) if h > 0 and w > 0 else None
+    ys, xs = np.where(binary > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return {'area_ratio': area_ratio, 'aspect_ratio': None, 'contour_area_ratio': None}
+    bw = max(1, int(xs.max() - xs.min() + 1))
+    bh = max(1, int(ys.max() - ys.min() + 1))
+    aspect_ratio = float(bw / bh)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour_area = max((cv2.contourArea(c) for c in contours), default=0.0)
+    contour_area_ratio = float(contour_area / (h * w)) if h > 0 and w > 0 else None
+    return {'area_ratio': area_ratio, 'aspect_ratio': aspect_ratio, 'contour_area_ratio': contour_area_ratio}
+
+
+def safe_abs_diff(v1, v2):
+    if v1 is None or v2 is None:
+        return None
+    return float(abs(v1 - v2))
+
+
+def qr_match_score(qr_text1, qr_text2, qr_found1, qr_found2):
+    if qr_found1 and qr_found2:
+        t1 = (qr_text1 or '').strip()
+        t2 = (qr_text2 or '').strip()
+        if not t1 or not t2:
+            return -1.0
+        return 1.0 if t1 == t2 else 0.0
+    return -1.0
+
+
+def build_feature_distances(feat1, feat2, mask1, mask2,
+                            qr_text1, qr_text2, qr_found1, qr_found2,
+                            spatial_feat1, spatial_feat2,
+                            img1, img2):
+    m1 = extract_mask_features(mask1)
+    m2 = extract_mask_features(mask2)
+
+    cosine_sim = 0.5
+    euclid_dist = 1.0
+    if feat1 is not None and feat2 is not None:
+        try:
+            cosine_sim = cosine_similarity(feat1, feat2)
+            euclid_dist = euclidean_distance(feat1, feat2)
+        except Exception:
+            pass
+
+    local_sim = compute_local_feature_similarity(spatial_feat1, spatial_feat2)
+
+    ssim = 0.5
+    if img1 is not None and img2 is not None:
+        try:
+            ssim = compute_ssim_fast(img1, img2)
+        except Exception:
+            pass
+
+    hist_sim = 0.5
+    if img1 is not None and img2 is not None:
+        try:
+            hist_sim = compute_histogram_similarity(img1, img2)
+        except Exception:
+            pass
+
+    texture_sim = 0.5
+    if img1 is not None and img2 is not None:
+        try:
+            texture_sim = compute_texture_similarity(img1, img2)
+        except Exception:
+            pass
+
+    return {
+        'qr_match_score': qr_match_score(qr_text1, qr_text2, qr_found1, qr_found2),
+        'cosine_similarity': cosine_sim,
+        'euclidean_distance': euclid_dist,
+        'cnn_local_similarity': local_sim,
+        'ssim': ssim,
+        'histogram_similarity': hist_sim,
+        'texture_similarity': texture_sim,
+        'mask_area_diff': safe_abs_diff(m1['area_ratio'], m2['area_ratio']),
+        'aspect_ratio_diff': safe_abs_diff(m1['aspect_ratio'], m2['aspect_ratio']),
+        'contour_area_diff': safe_abs_diff(m1['contour_area_ratio'], m2['contour_area_ratio']),
+    }
+
+
+def build_fitness_score(distances):
+    """构建综合匹配度分数 - 使用多维度特征融合"""
+    qr_score = distances['qr_match_score']
+    
+    # 二维码识别不清时，仍然提示重新拍摄
+    if qr_score == -1.0:
+        return 0.0, '二维码识别不清，请重新拍摄'
+    
+    # 二维码不一致时，继续计算相似度，但标记状态
+    qr_note = '二维码不一致' if qr_score == 0.0 else '二维码一致'
+
+    # 深度特征相似度（全局 + 局部）
+    cosine_score = max(0.0, min(1.0, distances['cosine_similarity']))
+    local_score = max(0.0, min(1.0, distances.get('cnn_local_similarity', cosine_score)))
+    
+    # 结构相似度
+    ssim_score = max(0.0, min(1.0, distances.get('ssim', 0.5)))
+    
+    # 颜色相似度
+    hist_score = max(0.0, min(1.0, distances.get('histogram_similarity', 0.5)))
+    
+    # 纹理相似度
+    texture_score = max(0.0, min(1.0, distances.get('texture_similarity', 0.5)))
+    
+    # 几何特征
+    euclidean_score = 1.0 / (1.0 + distances['euclidean_distance'])
+    area_score = 1.0 if distances['mask_area_diff'] is None else 1.0 / (1.0 + distances['mask_area_diff'] * 10)
+    aspect_score = 1.0 if distances['aspect_ratio_diff'] is None else 1.0 / (1.0 + distances['aspect_ratio_diff'] * 5)
+    contour_score = 1.0 if distances['contour_area_diff'] is None else 1.0 / (1.0 + distances['contour_area_diff'] * 10)
+
+    # 新的权重分配（更均衡的多维度融合）
+    # 深度特征：全局25% + 局部15% = 40%
+    # 感知特征：结构15% + 颜色10% + 纹理10% = 35%
+    # 几何特征：欧氏10% + 面积5% + 宽高比5% + 轮廓5% = 25%
+    
+    fitness = (
+        0.10 * cosine_score +      # 深度全局特征（余弦相似度）
+        0.10 * local_score +       # 深度局部特征
+        0.30 * ssim_score +        # 结构相似度(SSIM)
+        0.05 * hist_score +        # 颜色直方图相似度
+        0.10 * texture_score +     # 纹理特征（保留，未单独指定时分到剩余权重）
+        0.10 * euclidean_score +   # 欧氏距离（几何整体差异）
+        0.10 * area_score +        # 主目标面积差
+        0.05 * aspect_score +      # 宽高比差
+        0.10 * contour_score       # 轮廓面积差
+    )
+    
+    return float(fitness), qr_note
+
+
+def save_compare_outputs(pair_dir, image1_path, image2_path, crop1, crop2, rectified1, rectified2):
+    out1 = pair_dir / f"crop_1_{Path(image1_path).name}"
+    out2 = pair_dir / f"crop_2_{Path(image2_path).name}"
+    rect1 = pair_dir / f"rectified_1_{Path(image1_path).name}"
+    rect2 = pair_dir / f"rectified_2_{Path(image2_path).name}"
+    cv2.imwrite(str(out1), crop1)
+    cv2.imwrite(str(out2), crop2)
+    cv2.imwrite(str(rect1), rectified1)
+    cv2.imwrite(str(rect2), rectified2)
+    return out1, out2, rect1, rect2
+
+
+def save_compare_report(pair_dir, image1_path, image2_path, rect1, rect2, out1, out2, distances, fitness, decision_note, qr1, qr2, qr_text1, qr_text2, mask1, mask2, score_breakdown=None):
+    report_path = pair_dir / 'compare_report.txt'
+    
+    # 判断是否显示匹配度数值
+    qr_score = distances['qr_match_score']
+    if qr_score == -1.0:
+        fitness_display = "N/A (二维码识别不清)"
+    else:
+        # 二维码不一致时也显示匹配度
+        fitness_display = f"{fitness:.4f}"
+    
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write('=== 批量图片比较结果报告 ===\n\n')
+        f.write(f'原图1: {image1_path}\n')
+        f.write(f'原图2: {image2_path}\n\n')
+        f.write(f'拉正图1: {rect1}\n')
+        f.write(f'拉正图2: {rect2}\n')
+        f.write(f'裁剪图1: {out1}\n')
+        f.write(f'裁剪图2: {out2}\n\n')
+        f.write(f'二维码检测1: {"成功" if qr1 else "失败"}\n')
+        f.write(f'二维码检测2: {"成功" if qr2 else "失败"}\n')
+        f.write(f'二维码内容1: {qr_text1 if qr_text1 else "N/A"}\n')
+        f.write(f'二维码内容2: {qr_text2 if qr_text2 else "N/A"}\n')
+        f.write(f'二维码一致性: {decision_note}\n\n')
+        f.write(f'主目标分割1: {"成功" if mask1 is not None else "失败"}\n')
+        f.write(f'主目标分割2: {"成功" if mask2 is not None else "失败"}\n\n')
+        
+        # 详细计算值（只要二维码识别成功就显示，无论是否一致）
+        if qr_score != -1.0:
+            f.write('=== 深度特征 ===\n')
+            f.write(f'余弦相似度: {distances["cosine_similarity"]:.4f} (权重10%)\n')
+            f.write(f'局部特征相似度: {distances.get("cnn_local_similarity", 0):.4f} (权重10%)\n')
+            f.write(f'欧氏距离: {distances["euclidean_distance"]:.4f} -> 转换分: {1.0/(1.0+distances["euclidean_distance"]):.4f} (权重10%)\n\n')
+            
+            f.write('=== 感知特征 ===\n')
+            f.write(f'结构相似度(SSIM): {distances.get("ssim", 0):.4f} (权重30%)\n')
+            f.write(f'颜色直方图相似度: {distances.get("histogram_similarity", 0):.4f} (权重5%)\n')
+            f.write(f'纹理相似度: {distances.get("texture_similarity", 0):.4f} (权重10%)\n\n')
+            
+            f.write('=== 几何特征 ===\n')
+            f.write(f'主目标面积差: {distances["mask_area_diff"] if distances["mask_area_diff"] is not None else "N/A"} (权重10%)\n')
+            f.write(f'宽高比差: {distances["aspect_ratio_diff"] if distances["aspect_ratio_diff"] is not None else "N/A"} (权重5%)\n')
+            f.write(f'轮廓面积差: {distances["contour_area_diff"] if distances["contour_area_diff"] is not None else "N/A"} (权重10%)\n\n')
+        
+        f.write(f'最终匹配度: {fitness_display}\n')
+        if score_breakdown is not None and qr_score != -1.0:
+            f.write('\n=== 新融合得分公式 ===\n')
+            f.write('S = 0.45 * CNN/YOLO/QR + 0.30 * SP+LG + 0.15 * min(1, filtered_matches / 40) + 0.10 * inlier_ratio\n')
+            f.write(f"CNN/YOLO/QR 融合分(45%): {score_breakdown.get('cnn_fitness', 0.0):.4f}\n")
+            f.write(f"SP+LG 融合分(30%): {score_breakdown.get('sp_lg_score', 0.0):.4f}\n")
+            f.write(f"过滤后匹配得分(15%): {score_breakdown.get('sp_lg_filtered_match_score', 0.0):.4f}\n")
+            f.write(f"内点率得分(10%): {score_breakdown.get('sp_lg_inlier_ratio', 0.0):.4f}\n")
+            f.write(f"SP+LG 原始匹配数: {score_breakdown.get('sp_lg_raw_matches', 0)}\n")
+            f.write(f"SP+LG 过滤后匹配数: {score_breakdown.get('sp_lg_filtered_matches', 0)}\n")
+            f.write(f"SP+LG 内点数: {score_breakdown.get('sp_lg_inliers', 0)}\n")
+            f.write(f"SP+LG 平均置信度: {score_breakdown.get('sp_lg_mean_conf', 0.0):.4f}\n")
+            f.write(f"SP+LG 内点率: {score_breakdown.get('sp_lg_inlier_ratio', 0.0):.4f}\n")
+            f.write(f"融合总分: {score_breakdown.get('combined_score', fitness):.4f}\n")
+    return report_path
+
+
+def process_pair(model, image1_path, image2_path, pair_dir):
+    """One pair compare.
+
+    - Keep existing YOLO+CNN scoring as final decision/fitness.
+    - Additionally reuse Ronghe's keypoint matching (SuperPoint + LightGlue)
+      to generate the "one-to-one line" visualization like output_v2/linkedin_post.
+    """
+    img1 = load_image(image1_path)
+    img2 = load_image(image2_path)
+    crop1, mask1_full, box1, crop1_xyxy = segment_main_object(model, img1)
+    crop2, mask2_full, box2, crop2_xyxy = segment_main_object(model, img2)
+
+    crop1_mask = None
+    if mask1_full is not None and crop1_xyxy is not None:
+        x1, y1, x2, y2 = crop1_xyxy
+        crop1_mask = mask1_full[y1:y2 + 1, x1:x2 + 1]
+    crop2_mask = None
+    if mask2_full is not None and crop2_xyxy is not None:
+        x1, y1, x2, y2 = crop2_xyxy
+        crop2_mask = mask2_full[y1:y2 + 1, x1:x2 + 1]
+
+    rectified1, qr1, qr_text1, qr_points1, rect_mask1 = rectify_and_read_qr(crop1, crop1_mask)
+    rectified2, qr2, qr_text2, qr_points2, rect_mask2 = rectify_and_read_qr(crop2, crop2_mask)
+
+    out1, out2, rect1, rect2 = save_compare_outputs(pair_dir, image1_path, image2_path, crop1, crop2, rectified1, rectified2)
+
+    # ---------- (A) Ronghe keypoint matching for visualization ----------
+    match_overlay_data = None
+    sp_lg_score = 0.0
+    sp_lg_raw_matches = 0
+    sp_lg_filtered_matches = 0
+    sp_lg_inliers = 0
+    sp_lg_mean_conf = 0.0
+    sp_lg_inlier_ratio = 0.0
+    try:
+        # Reuse the already-rectified images here, so the lines are drawn onto
+        # vis_compare_rectified in the same coordinate system.
+        if SuperPoint is None or LightGlue is None:
+            raise RuntimeError('lightglue not available in current Python environment')
+
+        extractor = SuperPoint(max_num_keypoints=MAX_KEYPOINTS).eval().to(DEVICE)
+        matcher = LightGlue(features='superpoint').eval().to(DEVICE)
+
+        # Build tensor from current rectified images (same base images will also be used
+        # by vis_compare_rectified, so point-line overlay stays aligned)
+        gray0 = cv2.cvtColor(rectified1, cv2.COLOR_BGR2GRAY)
+        gray1 = cv2.cvtColor(rectified2, cv2.COLOR_BGR2GRAY)
+        enh0 = cv2.cvtColor(gray0, cv2.COLOR_GRAY2RGB)
+        enh1 = cv2.cvtColor(gray1, cv2.COLOR_GRAY2RGB)
+        tensor0 = torch.from_numpy(enh0).permute(2, 0, 1).float() / 255.0
+        tensor1 = torch.from_numpy(enh1).permute(2, 0, 1).float() / 255.0
+        match_base_img0 = rectified1.copy()
+        match_base_img1 = rectified2.copy()
+
+        with torch.no_grad():
+            feats0 = extractor.extract(tensor0[None].to(DEVICE))
+            feats1 = extractor.extract(tensor1[None].to(DEVICE))
+            matches01 = matcher({'image0': feats0, 'image1': feats1})
+
+        kpts0 = feats0['keypoints'][0]
+        kpts1 = feats1['keypoints'][0]
+        matches = matches01['matches'][0]
+        sp_lg_raw_matches = int(len(matches))
+        mscores = matches01.get('scores', None)
+        if mscores is not None:
+            mscores = mscores[0]
+
+        # Use rectified masks here if available; otherwise use empty masks
+        mask0 = rect_mask1 if rect_mask1 is not None else np.zeros(rectified1.shape[:2], dtype=np.uint8)
+        mask1 = rect_mask2 if rect_mask2 is not None else np.zeros(rectified2.shape[:2], dtype=np.uint8)
+
+        # 1) keep existing exclusion (e.g. sticker/mask region)
+        matches_f, mscores_f = filter_matches(kpts0, kpts1, matches, mscores, mask0, mask1)
+
+        # 2) additionally exclude QR polygon + surrounding blue sticker/ring region
+        qr_ex0 = build_qr_exclude_mask(rectified1.shape[:2], qr_points1)
+        qr_ex1 = build_qr_exclude_mask(rectified2.shape[:2], qr_points2)
+        blue_ex0 = build_blue_exclude_mask(rectified1)
+        blue_ex1 = build_blue_exclude_mask(rectified2)
+        exclude0 = cv2.bitwise_or(qr_ex0, blue_ex0)
+        exclude1 = cv2.bitwise_or(qr_ex1, blue_ex1)
+
+        matches_f, mscores_f = filter_matches_outside_exclude_masks(
+            kpts0, kpts1, matches_f, mscores_f, exclude0, exclude1
+        )
+
+        # 3) relative geometry consistency: relative to QR + relative to image borders
+        #    Use a relaxed threshold first; if it becomes too sparse, keep the pre-geometry result.
+        matches_before_geo = matches_f
+        mscores_before_geo = mscores_f
+        matches_geo, mscores_geo = filter_matches_by_relative_geometry(
+            kpts0, kpts1, matches_f, mscores_f,
+            rectified1.shape, rectified2.shape,
+            qr_points0=qr_points1, qr_points1=qr_points2,
+            max_qr_rel_diff=0.35,
+            max_edge_rel_diff=0.22,
+        )
+        if len(matches_geo) >= max(12, int(0.25 * max(len(matches_before_geo), 1))):
+            matches_f, mscores_f = matches_geo, mscores_geo
+        else:
+            matches_f, mscores_f = matches_before_geo, mscores_before_geo
+
+        score, mean_conf, inlier_ratio, inliers_mask, n = compute_score(kpts0, kpts1, matches_f, mscores_f)
+        sp_lg_score = float(score)
+        sp_lg_filtered_matches = int(len(matches_f))
+        sp_lg_inliers = int(np.sum(inliers_mask)) if len(inliers_mask) else 0
+        sp_lg_mean_conf = float(mean_conf)
+        sp_lg_inlier_ratio = float(inlier_ratio)
+
+        vis_path = Path(pair_dir) / 'ronghe_matches_sp_lg.png'
+        draw_matches_vis(
+            rectified1, rectified2,
+            kpts0, kpts1,
+            matches_f,
+            inliers_mask,
+            mask0, mask1,
+            title=f'SP+LG  score={score:.3f}  inliers={int(np.sum(inliers_mask))}/{len(inliers_mask)}',
+            save_path=str(vis_path),
+            rot_deg=0,
+            meta0=None,
+            meta1=None,
+        )
+
+        match_overlay_data = {
+            'pts0': kpts0[matches_f[:, 0]].detach().cpu().numpy() if len(matches_f) else np.zeros((0, 2), dtype=np.float32),
+            'pts1': kpts1[matches_f[:, 1]].detach().cpu().numpy() if len(matches_f) else np.zeros((0, 2), dtype=np.float32),
+            'inliers_mask': inliers_mask,
+            'shape0': rectified1.shape,
+            'shape1': rectified2.shape,
+        }
+    except Exception as e:
+        # Don't break main flow
+        print(f'[WARN] Ronghe keypoint matching visualization failed: {e}')
+
+    # ---------- (B) Existing CNN-based scoring ----------
+    feat1, spatial_feat1 = extract_feature_from_cropped(model, rectified1)
+    feat2, spatial_feat2 = extract_feature_from_cropped(model, rectified2)
+
+    distances = build_feature_distances(
+        feat1, feat2, rect_mask1, rect_mask2,
+        qr_text1, qr_text2, qr1, qr2,
+        spatial_feat1, spatial_feat2,
+        rectified1, rectified2
+    )
+
+    cnn_fitness, decision_note = build_fitness_score(distances)
+    filtered_match_score = min(1.0, float(sp_lg_filtered_matches) / 40.0)
+    fitness = float(
+        0.45 * cnn_fitness
+        + 0.30 * sp_lg_score
+        + 0.15 * filtered_match_score
+        + 0.10 * sp_lg_inlier_ratio
+    )
+    score_breakdown = {
+        'cnn_fitness': float(cnn_fitness),
+        'sp_lg_score': float(sp_lg_score),
+        'sp_lg_raw_matches': int(sp_lg_raw_matches),
+        'sp_lg_filtered_matches': int(sp_lg_filtered_matches),
+        'sp_lg_filtered_match_score': float(filtered_match_score),
+        'sp_lg_inliers': int(sp_lg_inliers),
+        'sp_lg_mean_conf': float(sp_lg_mean_conf),
+        'sp_lg_inlier_ratio': float(sp_lg_inlier_ratio),
+        'combined_score': float(fitness),
+    }
+    save_compare_report(pair_dir, image1_path, image2_path, rect1, rect2, out1, out2, distances, fitness, decision_note, qr1, qr2, qr_text1, qr_text2, rect_mask1, rect_mask2, score_breakdown=score_breakdown)
+    save_visualizations(
+        pair_dir, image1_path, image2_path,
+        img1, img2, rectified1, rectified2,
+        mask1_full, mask2_full, rect_mask1, rect_mask2,
+        box1, box2, crop1_xyxy, crop2_xyxy,
+        qr_points1, qr_points2, qr_text1, qr_text2,
+        fitness, decision_note,
+        match_overlay_data=match_overlay_data,
+        match_base_imgs=(match_base_img0, match_base_img1) if 'match_base_img0' in locals() else None,
+        score_breakdown=score_breakdown,
+    )
+    return fitness, decision_note, score_breakdown
+
+
+def find_pairs_in_folder(folder: Path):
+    """在单个子文件夹内决定哪些图片要互相比对。
+
+    默认规则（当前启用）：
+      - 只看文件名形如 A1 / B1 / A2 / B2 ...（扩展名任意，只要是图片）
+      - 跳过所有 C*（例如 C1/C2/C3 都不参与）
+      - 按相同编号配对：A1 对 B1，A2 对 B2，A3 对 B3 ...
+
+    如果你想手动改规则（例如 A1 与 B2 比对）：
+      1) 先在下面的 MANUAL_PAIR_MAP 里写映射（A编号 -> B编号）
+         例如：
+             MANUAL_PAIR_MAP = {
+                 '1': '2',  # A1 -> B2
+                 '2': '1',  # A2 -> B1
+             }
+      2) 然后把 USE_MANUAL_MAP 改成 True
+
+    注意：
+      - 只会对“映射存在且文件真实存在”的配对进行比对
+      - 仍然会跳过 C*
+    """
+
+    USE_MANUAL_MAP = False
+    MANUAL_PAIR_MAP = {
+        '1': '2',  # A1 -> B2
+        '2': '3',  # A2 -> B3
+        '3': '1',  # A3 -> B1
+    }
+
+    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VALID_EXTS]
+    a_map = {}
+    b_map = {}
+
+    for p in files:
+        stem = p.stem
+        m = re.match(r'^([ABCabc])(\d+)$', stem)
+        if not m:
+            continue
+        prefix = m.group(1).upper()
+        idx = m.group(2)
+        if prefix == 'C':
+            continue
+        if prefix == 'A':
+            a_map[idx] = p
+        elif prefix == 'B':
+            b_map[idx] = p
+
+    if USE_MANUAL_MAP:
+        pairs = []
+        # A编号 -> B编号
+        for a_idx, b_idx in MANUAL_PAIR_MAP.items():
+            if a_idx in a_map and b_idx in b_map:
+                # 返回的第一个 idx 仍然用 A 的编号，便于命名
+                pairs.append((a_idx, a_map[a_idx], b_map[b_idx]))
+        return pairs
+
+    common = sorted(set(a_map.keys()) & set(b_map.keys()), key=lambda x: int(x))
+    return [(idx, a_map[idx], b_map[idx]) for idx in common]
+
+
+def main():
+    if not MODEL_PATH.exists():
+        print('模型文件不存在。')
+        return
+    if not SAMPLE_DIR.exists():
+        print(f'样本目录不存在: {SAMPLE_DIR}')
+        return
+
+    run_dir = create_run_output_dir()
+    summary_lines = []
+    summary_rows = []
+    model = load_model()
+
+    folders = sorted([p for p in SAMPLE_DIR.iterdir() if p.is_dir()], key=lambda p: p.name)
+    if not folders:
+        print('样本目录下没有子文件夹。')
+        return
+
+    for folder in folders:
+        pairs = find_pairs_in_folder(folder)
+        if not pairs:
+            continue
+        folder_out = run_dir / folder.name
+        folder_out.mkdir(exist_ok=True)
+        print(f'处理文件夹: {folder.name}')
+        for idx, a_path, b_path in pairs:
+            pair_name = f'{a_path.stem}_vs_{b_path.stem}'
+            pair_dir = folder_out / pair_name
+            pair_dir.mkdir(exist_ok=True)
+            try:
+                fitness, decision_note, score_breakdown = process_pair(model, a_path, b_path, pair_dir)
+                summary = (
+                    f"{folder.name} | {pair_name} | {decision_note} | "
+                    f"CNN={score_breakdown.get('cnn_fitness', 0.0):.4f} | "
+                    f"SP+LG={score_breakdown.get('sp_lg_score', 0.0):.4f} | "
+                    f"匹配度={fitness:.4f}"
+                )
+                print(summary)
+                summary_lines.append(summary)
+                summary_rows.append({
+                    'folder': folder.name,
+                    'pair_name': pair_name,
+                    'decision_note': decision_note,
+                    'cnn_fitness': score_breakdown.get('cnn_fitness', 0.0),
+                    'sp_lg_score': score_breakdown.get('sp_lg_score', 0.0),
+                    'combined_score': fitness,
+                    'sp_lg_raw_matches': score_breakdown.get('sp_lg_raw_matches', 0),
+                    'sp_lg_filtered_matches': score_breakdown.get('sp_lg_filtered_matches', 0),
+                    'sp_lg_inliers': score_breakdown.get('sp_lg_inliers', 0),
+                    'sp_lg_mean_conf': score_breakdown.get('sp_lg_mean_conf', 0.0),
+                    'sp_lg_inlier_ratio': score_breakdown.get('sp_lg_inlier_ratio', 0.0),
+                    'pair_dir': str(pair_dir),
+                })
+            except Exception as e:
+                summary = f'{folder.name} | {pair_name} | 处理失败 | {e}'
+                print(summary)
+                summary_lines.append(summary)
+                summary_rows.append({
+                    'folder': folder.name,
+                    'pair_name': pair_name,
+                    'decision_note': '处理失败',
+                    'cnn_fitness': '',
+                    'sp_lg_score': '',
+                    'combined_score': '',
+                    'sp_lg_raw_matches': '',
+                    'sp_lg_filtered_matches': '',
+                    'sp_lg_inliers': '',
+                    'sp_lg_mean_conf': '',
+                    'sp_lg_inlier_ratio': '',
+                    'pair_dir': str(pair_dir),
+                })
+
+    # ===== 统计汇总（扫描 vs 对比度低） =====
+    total = 0
+    scan_fail = 0          # 处理失败 或 二维码识别不清
+    scan_ok = 0
+
+    # 在扫描成功中进一步拆分
+    qr_mismatch = 0        # 二维码不一致
+    qr_mismatch_low = 0    # 二维码不一致且对比度低
+    qr_mismatch_ok = 0     # 二维码不一致但对比正常
+    low_match = 0          # 对比度低（匹配度 < LOW_MATCH_THRESHOLD，不含二维码不一致）
+    ok_match = 0           # 对比正常
+
+    ge90 = 0               # 匹配度 >= 0.90（统计所有识别成功的情况）
+    ge80 = 0               # 匹配度 >= 0.80（统计所有识别成功的情况）
+    ge70 = 0               # 匹配度 >= 0.70（统计所有识别成功的情况）
+    ge60 = 0               # 匹配度 >= 0.60（统计所有识别成功的情况）
+    ge50 = 0               # 匹配度 >= 0.50（统计所有识别成功的情况）
+
+    for line in summary_lines:
+        if not line.strip():
+            continue
+        total += 1
+
+        if '处理失败' in line or '识别不清' in line or '请重新拍摄' in line:
+            scan_fail += 1
+            continue
+
+        # 提取匹配度数值
+        m = re.search(r'匹配度=([0-9]*\.?[0-9]+)', line)
+        v = None
+        if m:
+            v = float(m.group(1))
+            if v >= 0.90:
+                ge90 += 1
+            if v >= 0.80:
+                ge80 += 1
+            if v >= 0.70:
+                ge70 += 1
+            if v >= 0.60:
+                ge60 += 1
+            if v >= 0.50:
+                ge50 += 1
+
+        # 二维码不一致的情况
+        if '二维码不一致' in line:
+            scan_ok += 1
+            qr_mismatch += 1
+            # 使用相同阈值判断是否对比度低
+            if v is not None and v < LOW_MATCH_THRESHOLD:
+                qr_mismatch_low += 1
+            else:
+                qr_mismatch_ok += 1
+            continue
+
+        # 到这里是二维码一致的情况
+        scan_ok += 1
+
+        if v is not None and v < LOW_MATCH_THRESHOLD:
+            low_match += 1
+        else:
+            ok_match += 1
+
+    fail_rate = (scan_fail / total * 100.0) if total else 0.0
+    qr_mismatch_rate = (qr_mismatch / total * 100.0) if total else 0.0
+    low_match_rate = (low_match / scan_ok * 100.0) if scan_ok else 0.0
+    ok_match_rate = (ok_match / scan_ok * 100.0) if scan_ok else 0.0
+    qr_mismatch_low_rate = (qr_mismatch_low / qr_mismatch * 100.0) if qr_mismatch else 0.0
+
+    ge90_rate = (ge90 / scan_ok * 100.0) if scan_ok else 0.0
+    ge80_rate = (ge80 / scan_ok * 100.0) if scan_ok else 0.0
+    ge70_rate = (ge70 / scan_ok * 100.0) if scan_ok else 0.0
+    ge60_rate = (ge60 / scan_ok * 100.0) if scan_ok else 0.0
+    ge50_rate = (ge50 / scan_ok * 100.0) if scan_ok else 0.0
+
+    header = [
+        '=== 统计汇总 ===',
+        f'总扫描次数: {total}',
+        f'',
+        f'【二维码识别问题】',
+        f'  扫描失败次数: {scan_fail} (占比: {fail_rate:.2f}%)  [二维码识别不清]',
+        f'  二维码不一致次数: {qr_mismatch} (占比: {qr_mismatch_rate:.2f}%)  [二维码内容不同]',
+        f'    - 其中对比度低: {qr_mismatch_low} (占比: {qr_mismatch_low_rate:.2f}%) [匹配度<{LOW_MATCH_THRESHOLD}]',
+        f'    - 其中对比正常: {qr_mismatch_ok}',
+        f'',
+        f'【匹配度分析（仅统计二维码一致的情况）】',
+        f'  扫描成功次数: {scan_ok}',
+        f'  对比度低次数: {low_match} (占比: {low_match_rate:.2f}%)  [匹配度<{LOW_MATCH_THRESHOLD}]',
+        f'  对比正常次数: {ok_match} (占比: {ok_match_rate:.2f}%)',
+        f'',
+        f'【高分匹配统计（统计所有识别成功的情况）】',
+        f'  匹配度>=0.90: {ge90_rate:.2f}% ({ge90}/{scan_ok})',
+        f'  匹配度>=0.80: {ge80_rate:.2f}% ({ge80}/{scan_ok})',
+        f'  匹配度>=0.70: {ge70_rate:.2f}% ({ge70}/{scan_ok})',
+        f'  匹配度>=0.60: {ge60_rate:.2f}% ({ge60}/{scan_ok})',
+        f'  匹配度>=0.50: {ge50_rate:.2f}% ({ge50}/{scan_ok})',
+        '=== 明细 ===',
+    ]
+
+    summary_path = run_dir / 'summary.txt'
+    with open(summary_path, 'w', encoding='utf-8-sig') as f:
+        f.write('\n'.join(header))
+        if summary_lines:
+            f.write('\n')
+            f.write('\n'.join(summary_lines))
+        else:
+            f.write('没有找到可比较的 A/B 配对。')
+
+    csv_path = run_dir / 'summary_scores.csv'
+    import csv
+    with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'folder', 'pair_name', 'decision_note',
+            'cnn_fitness', 'sp_lg_score', 'combined_score',
+            'sp_lg_raw_matches', 'sp_lg_filtered_matches', 'sp_lg_inliers',
+            'sp_lg_mean_conf', 'sp_lg_inlier_ratio',
+        ])
+        writer.writeheader()
+        for row in summary_rows:
+            writer.writerow(row)
+
+    print('')
+    print(f'批量处理完成，结果目录: {run_dir}')
+    print(f'汇总文件: {summary_path}')
+    print(f'分数CSV: {csv_path}')
+
+
+if __name__ == '__main__':
+    main()
+
+

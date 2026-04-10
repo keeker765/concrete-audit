@@ -147,12 +147,38 @@ async def _run_match_core(wet_bytes: bytes, dry_bytes: bytes, method: str) -> di
 @app.get("/", response_class=HTMLResponse, summary="审计页面")
 def index_page():
     """嵌入式 audit_single 审计页面，POST 到 /audit_single/run。"""
-    # 直接复用 web/pages/audit_single.py 的 build_page()
     try:
         import web.pages.audit_single as _as
         return _as.build_page()
     except ImportError:
         return HTMLResponse("<h2>请从项目根目录启动：<code>python api/main.py</code></h2>")
+
+
+# ── GET /client ───────────────────────────────────────────────────────────────
+
+@app.get("/client", response_class=HTMLResponse, summary="独立 API 客户端页面")
+def client_page():
+    """独立 HTML 测试客户端（api/index.html），服务器地址已自动设为当前 host。"""
+    _here = os.path.dirname(os.path.abspath(__file__))
+    html_path = os.path.join(_here, "index.html")
+    try:
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        # 将默认服务器地址替换为空（由浏览器当前 origin 决定），
+        # fetch 时使用相对路径 /audit_single/run，无需手动填写
+        html = html.replace(
+            'value="http://localhost:8080"',
+            'value=""',
+        ).replace(
+            "getServer() + '/audit_single/run'",
+            "(getServer() || '') + '/audit_single/run'",
+        ).replace(
+            "getServer() + '/health'",
+            "(getServer() || '') + '/health'",
+        )
+        return HTMLResponse(html)
+    except FileNotFoundError:
+        return HTMLResponse("<h2>找不到 api/index.html</h2>", status_code=404)
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────

@@ -162,7 +162,8 @@ pip install -r requirements.txt
 ```
 concrete_audit/
 ├── api/
-│   └── main.py        ← 独立 JSON API 服务（端口 8080）
+│   ├── main.py        ← 独立 JSON API 服务（端口 8080）
+│   └── index.html     ← 可配置服务器地址的独立 HTML 客户端
 ├── data/              ← 全量数据（按供应商/批次组织）
 ├── samples/           ← 测试样本
 ├── output_v2/         ← 输出结果（自动创建）
@@ -186,7 +187,14 @@ python api/main.py
 uvicorn api.main:app --port 8080 --reload
 ```
 
-打开浏览器 **http://localhost:8080** → 拖拽上传湿/干照片 → 查看交互式匹配可视化。
+启动后可访问：
+
+| 地址 | 说明 |
+|------|------|
+| http://localhost:8080/ | 原版 audit_single 审计页（来自 web/）|
+| **http://localhost:8080/client** | **独立 HTML 客户端（推荐，可配置服务器地址）**|
+| http://localhost:8080/docs | Swagger 交互式 API 文档 |
+| http://localhost:8080/health | 健康检查 JSON |
 
 ### 命令行批量处理
 
@@ -222,6 +230,20 @@ cd web && uvicorn app:app --port 8765 --reload
 | 接口风格 | REST + multipart/form-data |
 | 交互文档 | http://localhost:8080/docs（Swagger UI）|
 | 首次启动 | 自动下载 SP+LG 模型权重（~50 MB，需联网）|
+| 浏览器客户端 | http://localhost:8080/client（可配置服务器地址的独立 HTML）|
+
+---
+
+### GET /client — 独立 HTML 客户端
+
+```http
+GET /client
+```
+
+返回 `api/index.html` 的 HTML 页面，与 `/` 相同的可视化功能，但增加了：
+- **可配置 API 服务器地址**（适用于远程部署场景）
+- **ROI 模式选择器**（sticker / square / dino）
+- **连接状态检查**按钮
 
 ---
 
@@ -264,13 +286,15 @@ Content-Type: multipart/form-data
 | `wet` | file | ✓ | 湿态照片（制作时拍摄）|
 | `dry` | file | ✓ | 干态照片（送检时拍摄）|
 | `method` | string | — | 匹配方法，默认 `sp`，可选 `aliked` / `sift` / `hardnet` |
+| `roi_mode` | string | — | ROI 提取模式，默认 `sticker`，可选 `square` / `dino`（见下方说明）|
 
 **curl 示例**
 
 ```bash
 curl -X POST http://localhost:8080/match \
   -F "wet=@wet_photo.jpg" \
-  -F "dry=@dry_photo.jpg"
+  -F "dry=@dry_photo.jpg" \
+  -F "roi_mode=sticker"
 ```
 
 **Python requests 示例**
@@ -284,7 +308,7 @@ resp = requests.post(
         "wet": open("wet.jpg", "rb"),
         "dry": open("dry.jpg", "rb"),
     },
-    data={"method": "sp"},
+    data={"method": "sp", "roi_mode": "sticker"},
 )
 result = resp.json()
 print(result["verdict"], result["score"])
@@ -343,12 +367,38 @@ print(result["verdict"], result["score"])
 curl -X POST http://localhost:8080/audit_single/run \
   -F "wet_file=@wet.jpg" \
   -F "dry_file=@dry.jpg" \
-  -F "method=sp"
+  -F "method=sp" \
+  -F "roi_mode=sticker"
 ```
 
 ---
 
+### roi_mode 说明
+
+| 值 | 依赖 | 内存需求 | 说明 |
+|----|------|---------|------|
+| `sticker`（**默认**）| 无 | 低 | 以蓝色贴纸为中心，半径 × 2.5 裁切圆形 ROI |
+| `square` | 无 | 低 | 以贴纸为中心，取图像边界范围内最大正方形 |
+| `dino` | Grounding DINO（~700 MB）| 高（≥ 8 GB）| 语义分割精确定位混凝土面，最准确但需大内存 |
+
+> **注意**：`dino` 模式首次使用会从 HuggingFace 自动下载约 700 MB 模型，并需要 Windows 系统虚拟内存足够大。  
+> 推荐生产环境使用 `sticker` 模式。
+
+---
+
 ## 常见问题
+
+### Q: Windows 报错 `OSError: 页面文件太小` (os error 1455)
+
+这是 Windows 虚拟内存不足，通常在 `roi_mode=dino` 时触发（加载 ~700 MB DINO 模型）。
+
+**解决方案 A（推荐）：使用 `roi_mode=sticker`（默认值），无需 DINO**
+
+**解决方案 B：扩大 Windows 虚拟内存**
+
+控制面板 → 系统 → 高级系统设置 → 性能 → 高级 → 虚拟内存 → 自定义大小，将最大值设为 RAM 的 2 倍以上（例如 16 GB RAM → 设为 32768 MB）。
+
+---
 
 ### Q: Mac 上 `pyzbar` 安装报错
 

@@ -4,6 +4,7 @@
 
 ## 目录
 
+- [⚡ 最小化部署（5 步）](#最小化部署5-步)
 - [环境要求](#环境要求)
 - [Windows 部署](#windows-部署)
 - [macOS 部署](#macos-部署)
@@ -11,6 +12,45 @@
 - [运行方式](#运行方式)
 - [API 文档](#api-文档)
 - [常见问题](#常见问题)
+
+---
+
+## ⚡ 最小化部署（5 步）
+
+> 适合快速上手，仅需跑通 `POST /match` 接口。
+
+**所需资源**
+
+| 资源 | 说明 |
+|------|------|
+| 内存 | ≥ 4 GB RAM |
+| 磁盘 | ≥ 1 GB（代码 + 模型权重 ~50 MB）|
+| GPU | 可选；CPU 亦可运行（慢约 5-10×）|
+| 网络 | 首次启动需联网下载模型（约 50 MB，自动完成）|
+| Python | 3.10+ |
+
+**步骤**
+
+```bash
+# 1. 获取代码
+git clone <repo_url> concrete_audit && cd concrete_audit
+
+# 2. 创建虚拟环境
+python -m venv .venv
+source .venv/bin/activate          # Mac/Linux
+# .venv\Scripts\activate           # Windows
+
+# 3. 安装 PyTorch（CPU 版，最小依赖）
+pip install torch torchvision
+
+# 4. 安装其余依赖
+pip install -r requirements.txt
+
+# 5. 启动 API（首次自动下载 ~50 MB 模型权重）
+python api/main.py
+```
+
+打开浏览器 → **http://localhost:8080** → 上传湿/干照片 → 查看鉴定结果。
 
 ---
 

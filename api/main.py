@@ -90,7 +90,8 @@ app.add_middleware(
 
 # ── 公共匹配逻辑 ──────────────────────────────────────────────────────────────
 
-async def _run_match_core(wet_bytes: bytes, dry_bytes: bytes, method: str) -> dict:
+async def _run_match_core(wet_bytes: bytes, dry_bytes: bytes,
+                          method: str, roi_mode: str = "sticker") -> dict:
     """执行完整流水线并返回与 audit_single/run 格式完全一致的字典。"""
     from pipeline.runner import _CACHED_MODELS
     if method not in _CACHED_MODELS:
@@ -106,7 +107,7 @@ async def _run_match_core(wet_bytes: bytes, dry_bytes: bytes, method: str) -> di
         with open(dry_path, "wb") as f:
             f.write(dry_bytes)
 
-        result = run_single_pair(wet_path, dry_path, method=method)
+        result = run_single_pair(wet_path, dry_path, method=method, roi_mode=roi_mode)
 
         return {
             "verdict":      result.get("verdict", "INVALID"),
@@ -199,15 +200,16 @@ def health():
 
 @app.post("/match", summary="鉴定一对试块照片（通用接口）")
 async def match(
-    wet:    UploadFile = File(..., description="湿态照片"),
-    dry:    UploadFile = File(..., description="干态照片"),
-    method: str = Form("sp", description="sp / aliked / sift / hardnet"),
+    wet:      UploadFile = File(..., description="湿态照片"),
+    dry:      UploadFile = File(..., description="干态照片"),
+    method:   str = Form("sp",      description="sp / aliked / sift / hardnet"),
+    roi_mode: str = Form("sticker", description="sticker / square / dino（dino 需要大内存）"),
 ):
     """
     返回与 `/audit_single/run` 完全相同的 JSON 格式，
     包含 base64 预处理图、ROI 图、匹配可视化图及匹配点坐标。
     """
-    data = await _run_match_core(await wet.read(), await dry.read(), method)
+    data = await _run_match_core(await wet.read(), await dry.read(), method, roi_mode)
     code = 500 if ("error" in data and not data.get("verdict")) else 200
     return JSONResponse(data, status_code=code)
 
@@ -219,12 +221,13 @@ async def audit_single_run(
     wet_file: UploadFile = File(..., description="湿态照片"),
     dry_file: UploadFile = File(..., description="干态照片"),
     method:   str = Form("sp"),
+    roi_mode: str = Form("sticker", description="sticker / square / dino"),
 ):
     """
     字段名与 web/pages/audit_single.py 的 HTML 表单保持一致，
     可直接在浏览器 `http://localhost:8080` 使用可视化审计界面。
     """
-    data = await _run_match_core(await wet_file.read(), await dry_file.read(), method)
+    data = await _run_match_core(await wet_file.read(), await dry_file.read(), method, roi_mode)
     code = 500 if ("error" in data and not data.get("verdict")) else 200
     return JSONResponse(data, status_code=code)
 

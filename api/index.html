@@ -118,14 +118,20 @@ button:disabled{opacity:.5;cursor:default}
     </div>
   </div>
 
-  <!-- method + run -->
+  <!-- method + roi + run -->
   <div class="section">
     <div class="section-title">匹配方法</div>
-    <select id="method" style="width:100%">
+    <select id="method" style="width:100%;margin-bottom:8px">
       <option value="sp" selected>SuperPoint + LightGlue</option>
       <option value="aliked">ALIKED + LightGlue</option>
       <option value="sift">SIFT + LightGlue</option>
       <option value="hardnet">DoGHardNet + LightGlue</option>
+    </select>
+    <div class="section-title" style="margin-top:4px">ROI 提取模式</div>
+    <select id="roiMode" style="width:100%">
+      <option value="sticker" selected>sticker（贴纸圆形裁切，推荐）</option>
+      <option value="square">square（正方形裁切）</option>
+      <option value="dino">dino（DINO 语义分割，需大内存）</option>
     </select>
     <button class="run" id="runBtn" onclick="runMatch()" disabled>▶ 运行匹配</button>
     <div id="status">← 请上传两张图片</div>
@@ -251,6 +257,7 @@ async function runMatch() {
   fd.append('wet_file', wetFile);
   fd.append('dry_file', dryFile);
   fd.append('method', document.getElementById('method').value);
+  fd.append('roi_mode', document.getElementById('roiMode').value);
 
   try {
     const resp = await fetch(getServer() + '/audit_single/run', { method: 'POST', body: fd });

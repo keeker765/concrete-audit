@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.config import DEVICE, MATCH_THRESHOLD, MIN_MATCHES
 from pipeline.runner import run_single_pair, _get_models
@@ -76,6 +77,14 @@ app = FastAPI(
     description="上传湿/干照片，返回 SuperPoint+LightGlue 造假鉴定结果。",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# 允许本地 HTML 文件（file://）及任意前端跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

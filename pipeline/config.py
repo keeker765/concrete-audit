@@ -16,11 +16,13 @@ from pathlib import Path
 # ============================================================
 # 配置
 # ============================================================
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-SAM_CHECKPOINT = r"C:\Users\29804\Desktop\classes\deep_learning\HW2\sam_vit_b_01ec64.pth"
-SAMPLES_DIR = Path(r"D:\py_projects\concrete_audit\samples")
-DATA_DIR    = Path(r"D:\py_projects\concrete_audit\data")
-OUTPUT_ROOT = Path(r"D:\py_projects\concrete_audit\output_v2")
+DEVICE = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+
+_PROJECT_ROOT = Path(__file__).parent.parent
+SAM_CHECKPOINT = Path(os.environ.get('SAM_CHECKPOINT', str(_PROJECT_ROOT / "models" / "sam_vit_b_01ec64.pth")))
+SAMPLES_DIR = _PROJECT_ROOT / "samples"
+DATA_DIR    = _PROJECT_ROOT / "data"
+OUTPUT_ROOT = _PROJECT_ROOT / "output_v2"
 OUTPUT_ROOT.mkdir(exist_ok=True)
 
 MAX_KEYPOINTS = 2048

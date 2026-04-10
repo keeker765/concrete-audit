@@ -1,0 +1,58 @@
+# ============================================================
+# 混凝土试块造假识别 — 依赖清单
+# ============================================================
+# 安装步骤:
+#   pip install -r requirements.txt
+#
+# Mac (Apple Silicon) 注意事项:
+#   1. PyTorch 请从官网安装 MPS 版本:
+#      pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#      或直接: pip install torch torchvision  (自动选择 CPU/MPS)
+#
+#   2. pyzbar 需要先安装系统库:
+#      brew install zbar
+#      然后: pip install pyzbar
+#
+#   3. SAM 模型文件放置路径: models/sam_vit_b_01ec64.pth
+#      (相对于项目根目录，或通过环境变量 SAM_CHECKPOINT 指定)
+#      下载地址: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+# ============================================================
+
+# ── 核心深度学习 ──────────────────────────────────────────
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+
+# ── 图像处理 ─────────────────────────────────────────────
+opencv-python>=4.8.0
+
+# ── 特征匹配 ─────────────────────────────────────────────
+# LightGlue (SuperPoint / ALIKED / SIFT / DoGHardNet)
+lightglue>=0.1.0
+
+# Kornia (LoFTR)
+kornia>=0.7.0
+
+# RoMa (dense warp matcher)
+romatch>=1.0.0
+
+# ── 语义分割 SAM ──────────────────────────────────────────
+# Meta Segment Anything (PyPI 没有官方包，从 GitHub 安装)
+git+https://github.com/facebookresearch/segment-anything.git
+
+# ── 目标检测 Grounding DINO ───────────────────────────────
+transformers>=4.38.0
+
+# ── QR 码识别 (pyzbar 为可选 fallback) ───────────────────
+# Mac 需先: brew install zbar
+pyzbar>=0.1.9
+
+# ── 配置文件解析 (MatchAnything 使用) ────────────────────
+yacs>=0.1.8
+
+# ── Web 服务 ─────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn>=0.29.0
+
+# ── Pillow (transformers 依赖) ────────────────────────────
+Pillow>=10.0.0
